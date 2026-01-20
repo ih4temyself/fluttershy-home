@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import os
 import random
+import threading
 import time
 
 import requests
@@ -17,8 +18,12 @@ HOST = os.getenv("HOST")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_USERS = os.getenv("ALLOWED_USERS", "").split(",")
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 
 bot = telebot.TeleBot(BOT_TOKEN)
+
+previous_state = None
+monitoring_enabled = True
 
 
 def create_headers(query_params=None):
@@ -77,6 +82,15 @@ def get_power_status(sn):
     return {"success": False, "error": data}
 
 
+def get_power_state(grid_in, load_out):
+    if grid_in > 10:
+        return "grid_on"
+    elif grid_in < 10 and load_out > 0:
+        return "grid_off"
+    else:
+        return "idle"
+
+
 def format_status_message(status, sn):
     if not status["success"]:
         return "❌ Error getting station data"
@@ -106,12 +120,8 @@ def format_status_message(status, sn):
 
 
 def create_keyboard():
-    markup = InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        InlineKeyboardButton("📊 status", callback_data="status"),
-        InlineKeyboardButton("🔄 refresh", callback_data="refresh"),
-        InlineKeyboardButton("ℹ️ help", callback_data="help"),
-    )
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(InlineKeyboardButton("🔄 refresh", callback_data="refresh"))
     return markup
 
 
@@ -121,28 +131,61 @@ def is_authorized(user_id):
     return str(user_id) in ALLOWED_USERS
 
 
+def send_alert_to_users(message):
+    if not ALLOWED_USERS or ALLOWED_USERS[0] == "":
+        return
+
+    for user_id in ALLOWED_USERS:
+        if user_id:
+            try:
+                bot.send_message(user_id, message, parse_mode="HTML")
+            except Exception as e:
+                print(f"Failed to send alert to {user_id}: {e}")
+
+
+def monitor_power_state():
+    global previous_state
+
+    while monitoring_enabled:
+        try:
+            sn = get_sn()
+            if sn:
+                status = get_power_status(sn)
+                if status["success"]:
+                    current_state = get_power_state(
+                        status["grid_in"], status["load_out"]
+                    )
+
+                    if previous_state is not None and previous_state != current_state:
+                        if current_state == "grid_on" and previous_state == "grid_off":
+                            alert_msg = (
+                                f"✅ <b>Світло УВІМКНЕНО!</b>\n\n"
+                                f"🔋 battery: {status['soc']}%\n"
+                                f"⚡ grid input: {status['grid_in']} W"
+                            )
+                            send_alert_to_users(alert_msg)
+                            print(f"[ALERT] Grid power ON")
+
+                        elif (
+                            current_state == "grid_off" and previous_state == "grid_on"
+                        ):
+                            alert_msg = (
+                                f"🔋😢 <b>Світло ВИМКНЕНО!</b>\n\n"
+                                f"🔋 battery: {status['soc']}%\n"
+                                f"📤 load output: {status['load_out']} W"
+                            )
+                            send_alert_to_users(alert_msg)
+                            print(f"[ALERT] Grid power OFF")
+
+                    previous_state = current_state
+
+        except Exception as e:
+            print(f"Monitor error: {e}")
+
+        time.sleep(CHECK_INTERVAL)
+
+
 @bot.message_handler(commands=["start"])
-def send_welcome(message):
-    if not is_authorized(message.from_user.id):
-        bot.reply_to(message, "❌ Unauthorized. Contact bot owner.")
-        return
-
-    welcome_text = "/status to check current power status\n/help for all commands"
-    bot.send_message(message.chat.id, welcome_text, reply_markup=create_keyboard())
-
-
-@bot.message_handler(commands=["help"])
-def send_help(message):
-    if not is_authorized(message.from_user.id):
-        return
-
-    help_text = "/status - current station status\n"
-    bot.send_message(
-        message.chat.id, help_text, parse_mode="HTML", reply_markup=create_keyboard()
-    )
-
-
-@bot.message_handler(commands=["status"])
 def send_status(message):
     if not is_authorized(message.from_user.id):
         bot.reply_to(message, "❌ unauthorized")
@@ -180,7 +223,7 @@ def handle_callback(call):
         bot.answer_callback_query(call.id, "❌ Unauthorized")
         return
 
-    if call.data in ["status", "refresh"]:
+    if call.data == "refresh":
         try:
             sn = get_sn()
             if not sn:
@@ -208,29 +251,20 @@ def handle_callback(call):
         except Exception:
             bot.answer_callback_query(call.id, "❌ Error", show_alert=True)
 
-    elif call.data == "help":
-        bot.answer_callback_query(call.id)
-        help_text = "/status - current station status\n"
-        try:
-            bot.edit_message_text(
-                help_text,
-                call.message.chat.id,
-                call.message.message_id,
-                parse_mode="HTML",
-                reply_markup=create_keyboard(),
-            )
-        except telebot.apihelper.ApiTelegramException:
-            pass
-
 
 @bot.message_handler(func=lambda message: True)
 def echo_all(message):
     if not is_authorized(message.from_user.id):
         return
-    bot.reply_to(message, "Use /status to check your EcoFlow station")
+    bot.reply_to(message, "Use /start to check your EcoFlow station")
 
 
 if __name__ == "__main__":
     print("🤖 EcoFlow Telegram Bot started...")
+    print(f"📡 Monitoring interval: {CHECK_INTERVAL} seconds")
+
+    monitor_thread = threading.Thread(target=monitor_power_state, daemon=True)
+    monitor_thread.start()
+
     print(f"📡 Polling for updates...")
     bot.infinity_polling()
